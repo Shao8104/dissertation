@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual Environment
+venv/
+env/
+fl_quant/
+
+# Dataset
+data/
+
+# VSCode
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model
+*.pth
+*.pt
+
+# System
+.DS_Store
