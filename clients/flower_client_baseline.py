@@ -1,5 +1,6 @@
 import sys
 import os
+import time
 from collections import OrderedDict
 
 sys.path.append(
@@ -10,16 +11,37 @@ sys.path.append(
 
 import flwr as fl
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
 from model import SimpleCNN
-from quantization import quantize_int8, dequantize_int8, calculate_size_bytes
+from quantization import calculate_size_bytes
+
 
 class FlowerClient(fl.client.NumPyClient):
+    """
+    Baseline FedAvg client.
+
+    This client uses standard float32 model parameters.
+    No quantization is applied.
+
+    Metrics recorded:
+    - training loss
+    - training time
+    - float32 model size
+    - upload communication cost
+    - download communication cost
+    - total communication cost
+    - test loss
+    - test accuracy
+    """
 
     def __init__(self, client_id):
+        self.client_id = client_id
         self.model = SimpleCNN()
+
+        self.device = torch.device("cpu")
+        self.model.to(self.device)
 
         transform = transforms.ToTensor()
 
@@ -30,24 +52,24 @@ class FlowerClient(fl.client.NumPyClient):
             transform=transform,
         )
 
-        from torch.utils.data import Subset
-
-        subset_size = len(full_trainset) // 5
+        num_clients = 5
+        subset_size = len(full_trainset) // num_clients
 
         start_idx = client_id * subset_size
 
-        if client_id == 4:
+        if client_id == num_clients - 1:
             end_idx = len(full_trainset)
         else:
             end_idx = start_idx + subset_size
 
         trainset = Subset(
             full_trainset,
-            range(start_idx, end_idx)
-       )
+            range(start_idx, end_idx),
+        )
+
         print(
-            f"Client {client_id}: "
-            f"{start_idx} - {end_idx}"
+            f"[Baseline] Client {self.client_id}: "
+            f"training samples {start_idx} - {end_idx}"
         )
 
         self.trainloader = DataLoader(
@@ -55,39 +77,33 @@ class FlowerClient(fl.client.NumPyClient):
             batch_size=64,
             shuffle=True,
         )
+
         testset = datasets.MNIST(
             "./data",
             train=False,
             download=False,
             transform=transform,
-)
+        )
 
         self.testloader = DataLoader(
             testset,
             batch_size=64,
             shuffle=False,
-)
+        )
 
     def get_parameters(self, config):
         parameters = [
-        val.cpu().numpy()
-        for _, val in self.model.state_dict().items()
-    ]
+            val.cpu().numpy()
+            for _, val in self.model.state_dict().items()
+        ]
 
-        original_size = calculate_size_bytes(parameters)
+        model_size_bytes = calculate_size_bytes(parameters)
 
-        quantized_params, scales = quantize_int8(parameters)
-
-        quantized_size = calculate_size_bytes(quantized_params)
-
-        print(f"Original Model Size: {original_size / 1024:.2f} KB")
-        print(f"Quantized Model Size: {quantized_size / 1024:.2f} KB")
         print(
-        f"Communication Reduction: "
-        f"{(1 - quantized_size / original_size) * 100:.2f}%"
-    )
+            f"[Baseline] Client {self.client_id} | "
+            f"Float32 model size: {model_size_bytes / 1024:.2f} KB"
+        )
 
-    # 注意：这里暂时返回原始参数，先只验证通信量统计
         return parameters
 
     def set_parameters(self, parameters):
@@ -109,79 +125,121 @@ class FlowerClient(fl.client.NumPyClient):
         )
 
     def fit(self, parameters, config):
-        try:
-            self.set_parameters(parameters)
+        self.set_parameters(parameters)
 
-            criterion = torch.nn.CrossEntropyLoss()
+        train_start_time = time.time()
 
-            optimizer = torch.optim.Adam(
-                self.model.parameters(),
-                lr=0.001,
-            )
+        criterion = torch.nn.CrossEntropyLoss()
 
-            self.model.train()
+        optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=0.001,
+        )
 
-            for images, labels in self.trainloader:
-                optimizer.zero_grad()
+        self.model.train()
 
-                outputs = self.model(images)
+        running_loss = 0.0
 
-                loss = criterion(outputs, labels)
+        for images, labels in self.trainloader:
+            images = images.to(self.device)
+            labels = labels.to(self.device)
 
-                loss.backward()
+            optimizer.zero_grad()
 
-                optimizer.step()
+            outputs = self.model(images)
 
-                
+            loss = criterion(outputs, labels)
 
-            print("Training OK")
+            loss.backward()
 
-            return (
-                self.get_parameters({}),
-                len(self.trainloader.dataset),
-                {},
-            )
+            optimizer.step()
 
-        except Exception as e:
-            print("FIT ERROR:", e)
-            raise
+            running_loss += loss.item()
+
+        train_time = time.time() - train_start_time
+        train_loss = running_loss / len(self.trainloader)
+
+        updated_parameters = self.get_parameters({})
+
+        model_size_bytes = calculate_size_bytes(updated_parameters)
+
+        upload_comm_bytes = model_size_bytes
+        download_comm_bytes = model_size_bytes
+        total_comm_bytes = upload_comm_bytes + download_comm_bytes
+
+        print(
+            f"[Baseline] Client {self.client_id} | "
+            f"Training OK | "
+            f"Train loss: {train_loss:.4f} | "
+            f"Train time: {train_time:.2f}s | "
+            f"Upload: {upload_comm_bytes / 1024:.2f} KB | "
+            f"Download: {download_comm_bytes / 1024:.2f} KB | "
+            f"Total comm: {total_comm_bytes / 1024:.2f} KB"
+        )
+
+        return (
+            updated_parameters,
+            len(self.trainloader.dataset),
+            {
+                "method": "baseline",
+                "client_id": self.client_id,
+                "train_loss": train_loss,
+                "train_time": train_time,
+                "model_size_bytes": model_size_bytes,
+                "upload_comm_bytes": upload_comm_bytes,
+                "download_comm_bytes": download_comm_bytes,
+                "total_comm_bytes": total_comm_bytes,
+            },
+        )
 
     def evaluate(self, parameters, config):
-
         self.set_parameters(parameters)
+
+        criterion = torch.nn.CrossEntropyLoss()
 
         self.model.eval()
 
+        total_loss = 0.0
         correct = 0
         total = 0
 
         with torch.no_grad():
+            for images, labels in self.testloader:
+                images = images.to(self.device)
+                labels = labels.to(self.device)
 
-         for images, labels in self.testloader:
+                outputs = self.model(images)
 
-            outputs = self.model(images)
+                loss = criterion(outputs, labels)
+                total_loss += loss.item()
 
-            _, predicted = torch.max(
-                outputs.data,
-                1,
-            )
+                _, predicted = torch.max(
+                    outputs.data,
+                    1,
+                )
 
-            total += labels.size(0)
+                total += labels.size(0)
 
-            correct += (
-                predicted == labels
-            ).sum().item()
+                correct += (
+                    predicted == labels
+                ).sum().item()
 
+        test_loss = total_loss / len(self.testloader)
         accuracy = correct / total
 
         print(
-        f"Accuracy: {accuracy:.4f}"
-    )
+            f"[Baseline] Client {self.client_id} | "
+            f"Test loss: {test_loss:.4f} | "
+            f"Accuracy: {accuracy:.4f}"
+        )
 
         return (
-        0.0,
-        total,
-        {
-            "accuracy": accuracy
-        }
-    )
+            test_loss,
+            total,
+            {
+                "method": "baseline",
+                "client_id": self.client_id,
+                "accuracy": accuracy,
+                "test_loss": test_loss,
+            },
+        )
