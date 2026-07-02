@@ -145,341 +145,161 @@ def calculate_reduction(original_params, quantized_params, scales):
 
 # =========================================
 # Adaptive Uniform Quantization
-# Support:
-# 4-bit
-# 6-bit
-# 8-bit
+# Support 4-bit / 6-bit / 8-bit
 # =========================================
 
-import numpy as np
-
-
-def quantize_uniform_for_flower(
-    parameters,
-    bits,
-):
+def quantize_uniform_for_flower(parameters, bits):
     """
-    Symmetric Uniform Quantization
+    Quantize float32 parameters using symmetric uniform quantization.
 
-    Parameters:
+    Fixed INT8:
+        bits = 8
 
-        parameters:
-            float32 model parameters
-
-        bits:
-            quantization bit-width
-
-    Returns:
-
-        flower_quantized_params:
-            float32 carrier for Flower
-
-        q_params:
-            quantized integer arrays
-
-        scales:
-            scale for each tensor
+    Adaptive:
+        bits = 4, 6, or 8
     """
 
-    flower_quantized_params = []
+    if bits not in [4, 6, 8]:
+        raise ValueError(
+            f"Unsupported bit-width: {bits}. "
+            "Only 4, 6, and 8 bits are supported."
+        )
 
-    q_params = []
-
+    quantized_params = []
+    flower_params = []
     scales = []
 
-    qmax = (
-
-        2 ** (bits - 1)
-
-    ) - 1
-
-    qmin = -(
-
-        2 ** (bits - 1)
-
-    )
+    qmax = (2 ** (bits - 1)) - 1
+    qmin = -(2 ** (bits - 1))
 
     for param in parameters:
+        param = param.astype(np.float32)
 
-        max_val = np.max(
-
-            np.abs(param)
-
-        )
-
-        # Avoid divide by zero
+        max_val = np.max(np.abs(param))
 
         if max_val == 0:
-
             scale = 1.0
-
         else:
+            scale = max_val / qmax
 
-            scale = (
+        q_param = np.round(param / scale)
+        q_param = np.clip(q_param, qmin, qmax)
+        q_param = q_param.astype(np.int32)
 
-                max_val
+        quantized_params.append(q_param)
+        scales.append(float(scale))
 
-                /
+        # Flower NumPyClient transports ndarrays.
+        # We use float32 as carrier, but logical cost is calculated by bit-width.
+        flower_params.append(q_param.astype(np.float32))
 
-                qmax
+    return flower_params, quantized_params, scales
 
-            )
 
-        q = np.round(
+def dequantize_uniform_from_flower(flower_params, scales, bits):
+    """
+    Dequantize Flower-carried quantized parameters back to float32.
+    """
 
-            param
-
-            /
-
-            scale
-
+    if bits not in [4, 6, 8]:
+        raise ValueError(
+            f"Unsupported bit-width: {bits}. "
+            "Only 4, 6, and 8 bits are supported."
         )
 
-        q = np.clip(
+    dequantized_params = []
 
-            q,
+    qmax = (2 ** (bits - 1)) - 1
+    qmin = -(2 ** (bits - 1))
 
-            qmin,
+    for q_param, scale in zip(flower_params, scales):
+        q_param = np.round(q_param)
+        q_param = np.clip(q_param, qmin, qmax)
+        q_param = q_param.astype(np.float32)
 
-            qmax,
+        param = q_param * scale
+        dequantized_params.append(param.astype(np.float32))
 
+    return dequantized_params
+
+
+def calculate_uniform_payload_size_bytes(quantized_params, scales, bits):
+    """
+    Calculate logical communication payload size for adaptive quantization.
+
+    Note:
+        The arrays are stored as int32 in Python for convenience,
+        but the communication cost is calculated using the selected bit-width.
+    """
+
+    if bits not in [4, 6, 8]:
+        raise ValueError(
+            f"Unsupported bit-width: {bits}. "
+            "Only 4, 6, and 8 bits are supported."
         )
 
-        q = q.astype(
+    total_bits = 0
 
-            np.int32
+    for q_param in quantized_params:
+        total_bits += q_param.size * bits
 
-        )
+    weight_bytes = total_bits / 8
 
-        q_params.append(
+    # one float32 scale per tensor
+    scale_bytes = len(scales) * 4
 
-            q
+    return int(weight_bytes + scale_bytes)
 
-        )
 
-        scales.append(
+def calculate_uniform_reduction(original_params, quantized_params, scales, bits):
+    """
+    Calculate upload communication reduction compared with float32 upload.
+    """
 
-            float(scale)
+    original_size = calculate_size_bytes(original_params)
 
-        )
-
-        # Flower does not support int4/int6/int8
-
-        # Use float32 carrier
-
-        flower_quantized_params.append(
-
-            q.astype(
-
-                np.float32
-
-            )
-
-        )
-
-    return (
-
-        flower_quantized_params,
-
-        q_params,
-
+    quantized_size = calculate_uniform_payload_size_bytes(
+        quantized_params,
         scales,
+        bits,
+    )
+
+    reduction = (
+        1.0 - quantized_size / original_size
+    ) * 100.0
+
+    return original_size, quantized_size, reduction
+# =========================================
+# Serialize / Deserialize Scales
+# =========================================
+
+def serialize_scales(scales):
+    """
+    Convert scales list to string for Flower metrics.
+    """
+
+    return ",".join(
+
+        [
+
+            str(s)
+
+            for s in scales
+
+        ]
 
     )
 
 
-# =========================================
-# Adaptive Dequantization
-# =========================================
-
-def dequantize_uniform_from_flower(
-
-    flower_params,
-
-    scales,
-
-    bits,
-
-):
+def deserialize_scales(serialized_scales):
     """
-    Recover float32 parameters from
-    Flower float32 carrier.
-
-    Parameters:
-
-        flower_params:
-
-            float32 carrier
-
-        scales:
-
-            quantization scales
-
-        bits:
-
-            quantization bit-width
-
-    Returns:
-
-        restored_params
-
+    Recover scales list from string.
     """
 
-    restored_params = []
+    return [
 
-    qmax = (
+        float(s)
 
-        2 ** (bits - 1)
+        for s in serialized_scales.split(",")
 
-    ) - 1
-
-    qmin = -(
-
-        2 ** (bits - 1)
-
-    )
-
-    for param, scale in zip(
-
-        flower_params,
-
-        scales,
-
-    ):
-
-        q = np.round(
-
-            param
-
-        )
-
-        q = np.clip(
-
-            q,
-
-            qmin,
-
-            qmax,
-
-        )
-
-        q = q.astype(
-
-            np.float32
-
-        )
-
-        restored = (
-
-            q
-
-            *
-
-            scale
-
-        )
-
-        restored_params.append(
-
-            restored.astype(
-
-                np.float32
-
-            )
-
-        )
-
-    return restored_params
-
-
-# =========================================
-# Adaptive Communication Cost
-# =========================================
-
-def calculate_quantized_payload_size_bytes(
-
-    q_params,
-
-    scales,
-
-):
-    """
-    Calculate logical payload size.
-
-    Quantized weights:
-
-        int32 arrays are used in Python,
-
-        but communication cost is calculated
-
-        according to logical bit-width.
-
-    """
-
-    total_bytes = 0
-
-    for q, scale in zip(
-
-        q_params,
-
-        scales,
-
-    ):
-
-        bits = int(
-
-            np.ceil(
-
-                np.log2(
-
-                    np.max(
-
-                        np.abs(q)
-
-                    )
-
-                    +
-
-                    1
-
-                )
-
-            )
-
-        )
-
-        bits = max(
-
-            bits + 1,
-
-            4,
-
-        )
-
-        payload_bits = (
-
-            q.size
-
-            *
-
-            bits
-
-        )
-
-        payload_bytes = (
-
-            payload_bits
-
-            /
-
-            8
-
-        )
-
-        total_bytes += payload_bytes
-
-        # scale stored as float32
-
-        total_bytes += 4
-
-    return int(total_bytes)
+    ]

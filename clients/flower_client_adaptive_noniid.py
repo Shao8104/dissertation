@@ -11,11 +11,11 @@ sys.path.append(
 
 import flwr as fl
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
 from model import SimpleCNN
-from adaptive_policy import AdaptivePolicy
+from adaptive_policy_noniid import AdaptivePolicy
 from network_simulator import (
     simulate_network_condition,
     estimate_transmission_time,
@@ -27,18 +27,12 @@ from quantization import (
     calculate_uniform_reduction,
     serialize_scales,
 )
+from data_utils import create_label_noniid_subset
 
 
 class FlowerClient(fl.client.NumPyClient):
     """
-    Adaptive Quantization Client.
-
-    Server sends float32 global model.
-    Client trains locally in float32.
-    Client simulates heterogeneous network condition.
-    Client selects bit-width using lightweight adaptive policy.
-    Client uploads quantized parameters using Flower-compatible float32 carrier.
-    Server dequantizes before FedAvg aggregation.
+    Adaptive Quantization Client under Non-IID data distribution.
     """
 
     def __init__(self, client_id):
@@ -58,24 +52,15 @@ class FlowerClient(fl.client.NumPyClient):
             transform=transform,
         )
 
-        num_clients = 5
-        subset_size = len(full_trainset) // num_clients
-
-        start_idx = client_id * subset_size
-
-        if client_id == num_clients - 1:
-            end_idx = len(full_trainset)
-        else:
-            end_idx = start_idx + subset_size
-
-        trainset = Subset(
+        trainset, labels = create_label_noniid_subset(
             full_trainset,
-            range(start_idx, end_idx),
+            client_id,
         )
 
         print(
-            f"[Adaptive] Client {self.client_id}: "
-            f"training samples {start_idx} - {end_idx}"
+            f"[Adaptive Non-IID] Client {self.client_id} | "
+            f"Labels: {labels} | "
+            f"Samples: {len(trainset)}"
         )
 
         self.trainloader = DataLoader(
@@ -180,11 +165,26 @@ class FlowerClient(fl.client.NumPyClient):
 
         bit_width = int(policy_result["bit_width"])
 
-        # Safety check
-        assert bit_width in [4, 6, 8], (f"Invalid bit-width: {bit_width}")
+        assert bit_width in [4, 6, 8], (
+            f"Invalid bit-width: {bit_width}"
+        )
 
         network_score = float(policy_result["network_score"])
         loss_change = float(policy_result["loss_change"])
+
+        training_score = float(
+            policy_result.get(
+                "training_score",
+                0.0,
+            )
+        )
+
+        final_score = float(
+            policy_result.get(
+                "final_score",
+                network_score,
+            )
+        )
 
         float32_params = self.get_float32_parameters()
 
@@ -225,25 +225,23 @@ class FlowerClient(fl.client.NumPyClient):
         estimated_total_time = train_time + estimated_upload_time
 
         print(
-            f"[Adaptive] Client {self.client_id} | "
+            f"[Adaptive Non-IID] Client {self.client_id} | "
             f"Round: {server_round} | "
             f"Train loss: {train_loss:.4f} | "
-            f"Train time: {train_time:.2f}s | "
+            f"Bit-width: {bit_width} | "
             f"Bandwidth: {bandwidth_mbps:.2f} Mbps | "
             f"Latency: {latency_ms:.2f} ms | "
             f"Network score: {network_score:.4f} | "
-            f"Loss change: {loss_change:.4f} | "
-            f"Bit-width: {bit_width} | "
-            f"Upload: {upload_comm_bytes / 1024:.2f} KB | "
-            f"Reduction: {reduction:.2f}% | "
-            f"Estimated upload time: {estimated_upload_time:.4f}s"
+            f"Training score: {training_score:.4f} | "
+            f"Final score: {final_score:.4f} | "
+            f"Upload: {upload_comm_bytes / 1024:.2f} KB"
         )
 
         return (
             flower_quantized_params,
             len(self.trainloader.dataset),
             {
-                "method": "adaptive",
+                "method": "adaptive_noniid",
                 "client_id": int(self.client_id),
                 "server_round": int(server_round),
                 "train_loss": float(train_loss),
@@ -251,6 +249,8 @@ class FlowerClient(fl.client.NumPyClient):
                 "bandwidth_mbps": float(bandwidth_mbps),
                 "latency_ms": float(latency_ms),
                 "network_score": float(network_score),
+                "training_score": float(training_score),
+                "final_score": float(final_score),
                 "loss_change": float(loss_change),
                 "bit_width": int(bit_width),
                 "original_size_bytes": int(original_size),
@@ -285,10 +285,7 @@ class FlowerClient(fl.client.NumPyClient):
                 loss = criterion(outputs, labels)
                 total_loss += loss.item()
 
-                _, predicted = torch.max(
-                    outputs.data,
-                    1,
-                )
+                _, predicted = torch.max(outputs.data, 1)
 
                 total += labels.size(0)
 
@@ -299,17 +296,11 @@ class FlowerClient(fl.client.NumPyClient):
         test_loss = total_loss / len(self.testloader)
         accuracy = correct / total
 
-        print(
-            f"[Adaptive] Client {self.client_id} | "
-            f"Test loss: {test_loss:.4f} | "
-            f"Accuracy: {accuracy:.4f}"
-        )
-
         return (
             test_loss,
             total,
             {
-                "method": "adaptive",
+                "method": "adaptive_noniid",
                 "client_id": int(self.client_id),
                 "accuracy": float(accuracy),
                 "test_loss": float(test_loss),

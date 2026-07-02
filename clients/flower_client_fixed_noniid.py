@@ -11,40 +11,34 @@ sys.path.append(
 
 import flwr as fl
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
 from model import SimpleCNN
-from adaptive_policy import AdaptivePolicy
-from network_simulator import (
-    simulate_network_condition,
-    estimate_transmission_time,
-)
 from quantization import (
     calculate_size_bytes,
-    quantize_uniform_for_flower,
-    calculate_uniform_payload_size_bytes,
-    calculate_uniform_reduction,
+    calculate_int8_payload_size_bytes,
+    calculate_reduction,
+    quantize_int8_for_flower,
     serialize_scales,
 )
 
 
 class FlowerClient(fl.client.NumPyClient):
     """
-    Adaptive Quantization Client.
+    Fixed INT8 Quantization Client.
 
     Server sends float32 global model.
     Client trains locally in float32.
-    Client simulates heterogeneous network condition.
-    Client selects bit-width using lightweight adaptive policy.
-    Client uploads quantized parameters using Flower-compatible float32 carrier.
+    Client quantizes updated parameters to int8.
+    Client uploads quantized values using Flower-compatible float32 carrier.
+    Scales are sent through metrics.
     Server dequantizes before FedAvg aggregation.
     """
 
     def __init__(self, client_id):
         self.client_id = client_id
         self.model = SimpleCNN()
-        self.policy = AdaptivePolicy()
 
         self.device = torch.device("cpu")
         self.model.to(self.device)
@@ -58,25 +52,26 @@ class FlowerClient(fl.client.NumPyClient):
             transform=transform,
         )
 
-        num_clients = 5
-        subset_size = len(full_trainset) // num_clients
+        from data_utils import create_label_noniid_subset
 
-        start_idx = client_id * subset_size
-
-        if client_id == num_clients - 1:
-            end_idx = len(full_trainset)
-        else:
-            end_idx = start_idx + subset_size
-
-        trainset = Subset(
+        trainset, labels = create_label_noniid_subset(
             full_trainset,
-            range(start_idx, end_idx),
+            client_id,
         )
 
         print(
-            f"[Adaptive] Client {self.client_id}: "
-            f"training samples {start_idx} - {end_idx}"
+            f"[Fixed INT8 Non-IID] "
+            f"Client {self.client_id} | "
+            f"Labels: {labels} | "
+            f"Samples: {len(trainset)}"
         )
+
+        print(
+            f"[Fixed INT8 Non-IID] "
+            f"Client {self.client_id} | "
+            f"Labels: {labels} | "
+            f"Samples: {len(trainset)}"
+     )
 
         self.trainloader = DataLoader(
             trainset,
@@ -104,6 +99,11 @@ class FlowerClient(fl.client.NumPyClient):
         ]
 
     def get_parameters(self, config):
+        """
+        Used only if server requests initial parameters.
+        Fixed experiment should normally use server-side initial_parameters.
+        """
+
         return self.get_float32_parameters()
 
     def set_parameters(self, parameters):
@@ -126,13 +126,6 @@ class FlowerClient(fl.client.NumPyClient):
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
-
-        server_round = int(
-            config.get(
-                "server_round",
-                1,
-            )
-        )
 
         train_start_time = time.time()
 
@@ -166,100 +159,54 @@ class FlowerClient(fl.client.NumPyClient):
         train_time = time.time() - train_start_time
         train_loss = running_loss / len(self.trainloader)
 
-        bandwidth_mbps, latency_ms = simulate_network_condition(
-            client_id=self.client_id,
-            server_round=server_round,
-        )
-
-        policy_result = self.policy.choose_bitwidth(
-            bandwidth_mbps=bandwidth_mbps,
-            latency_ms=latency_ms,
-            train_loss=train_loss,
-            server_round=server_round,
-        )
-
-        bit_width = int(policy_result["bit_width"])
-
-        # Safety check
-        assert bit_width in [4, 6, 8], (f"Invalid bit-width: {bit_width}")
-
-        network_score = float(policy_result["network_score"])
-        loss_change = float(policy_result["loss_change"])
-
         float32_params = self.get_float32_parameters()
 
         (
             flower_quantized_params,
-            quantized_params,
+            int8_params,
             scales,
-        ) = quantize_uniform_for_flower(
+        ) = quantize_int8_for_flower(float32_params)
+
+        original_size, quantized_size, reduction = calculate_reduction(
             float32_params,
-            bit_width,
-        )
-
-        original_size, quantized_size, reduction = calculate_uniform_reduction(
-            float32_params,
-            quantized_params,
+            int8_params,
             scales,
-            bit_width,
         )
 
-        upload_comm_bytes = calculate_uniform_payload_size_bytes(
-            quantized_params,
+        upload_comm_bytes = calculate_int8_payload_size_bytes(
+            int8_params,
             scales,
-            bit_width,
         )
 
-        download_comm_bytes = calculate_size_bytes(
-            float32_params
-        )
+        download_comm_bytes = calculate_size_bytes(float32_params)
 
         total_comm_bytes = upload_comm_bytes + download_comm_bytes
 
-        estimated_upload_time = estimate_transmission_time(
-            payload_bytes=upload_comm_bytes,
-            bandwidth_mbps=bandwidth_mbps,
-            latency_ms=latency_ms,
-        )
-
-        estimated_total_time = train_time + estimated_upload_time
-
         print(
-            f"[Adaptive] Client {self.client_id} | "
-            f"Round: {server_round} | "
+            f"[Fixed INT8] Client {self.client_id} | "
+            f"Training OK | "
             f"Train loss: {train_loss:.4f} | "
             f"Train time: {train_time:.2f}s | "
-            f"Bandwidth: {bandwidth_mbps:.2f} Mbps | "
-            f"Latency: {latency_ms:.2f} ms | "
-            f"Network score: {network_score:.4f} | "
-            f"Loss change: {loss_change:.4f} | "
-            f"Bit-width: {bit_width} | "
-            f"Upload: {upload_comm_bytes / 1024:.2f} KB | "
+            f"Original: {original_size / 1024:.2f} KB | "
+            f"INT8 upload: {upload_comm_bytes / 1024:.2f} KB | "
             f"Reduction: {reduction:.2f}% | "
-            f"Estimated upload time: {estimated_upload_time:.4f}s"
+            f"Download: {download_comm_bytes / 1024:.2f} KB | "
+            f"Total comm: {total_comm_bytes / 1024:.2f} KB"
         )
 
         return (
             flower_quantized_params,
             len(self.trainloader.dataset),
             {
-                "method": "adaptive",
-                "client_id": int(self.client_id),
-                "server_round": int(server_round),
+                "method": "fixed_int8",
+                "client_id": self.client_id,
                 "train_loss": float(train_loss),
                 "train_time": float(train_time),
-                "bandwidth_mbps": float(bandwidth_mbps),
-                "latency_ms": float(latency_ms),
-                "network_score": float(network_score),
-                "loss_change": float(loss_change),
-                "bit_width": int(bit_width),
                 "original_size_bytes": int(original_size),
                 "upload_comm_bytes": int(upload_comm_bytes),
                 "download_comm_bytes": int(download_comm_bytes),
                 "total_comm_bytes": int(total_comm_bytes),
                 "communication_reduction": float(reduction),
-                "estimated_upload_time": float(estimated_upload_time),
-                "estimated_total_time": float(estimated_total_time),
                 "scales": serialize_scales(scales),
             },
         )
@@ -283,6 +230,7 @@ class FlowerClient(fl.client.NumPyClient):
                 outputs = self.model(images)
 
                 loss = criterion(outputs, labels)
+
                 total_loss += loss.item()
 
                 _, predicted = torch.max(
@@ -300,7 +248,7 @@ class FlowerClient(fl.client.NumPyClient):
         accuracy = correct / total
 
         print(
-            f"[Adaptive] Client {self.client_id} | "
+            f"[Fixed INT8] Client {self.client_id} | "
             f"Test loss: {test_loss:.4f} | "
             f"Accuracy: {accuracy:.4f}"
         )
@@ -309,8 +257,8 @@ class FlowerClient(fl.client.NumPyClient):
             test_loss,
             total,
             {
-                "method": "adaptive",
-                "client_id": int(self.client_id),
+                "method": "fixed_int8",
+                "client_id": self.client_id,
                 "accuracy": float(accuracy),
                 "test_loss": float(test_loss),
             },

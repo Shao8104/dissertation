@@ -33,9 +33,9 @@ with open(
 
     writer.writerow([
 
-        "Round",
+        "round",
 
-        "Accuracy",
+        "accuracy",
 
         "Loss",
 
@@ -47,7 +47,7 @@ with open(
 
         "Download Comm(KB)",
 
-        "Total Comm(KB)"
+        "total_comm_kb"
 
     ])
 

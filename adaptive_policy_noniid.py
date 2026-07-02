@@ -100,10 +100,10 @@ class AdaptivePolicy:
             bit_width = 8
 
         # Strong convergence phase (still allow adaptation)
-        elif final_score < 0.35:
+        elif final_score < 0.20:
             bit_width = 4
 
-        elif final_score < 0.70:
+        elif final_score < 0.60:
             bit_width = 6
 
         else:
